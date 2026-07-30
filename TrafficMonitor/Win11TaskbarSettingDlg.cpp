@@ -84,6 +84,7 @@ BOOL CWin11TaskbarSettingDlg::OnInitDialog()
     m_window_offset_left_edit.SetRange(-800, 800);
     m_window_offset_left_edit.SetValue(m_data.window_offset_left);
     CheckDlgButton(IDC_AVOID_OVERLAP_RIGHT_WIDGETS_CHECK, m_data.avoid_overlap_with_widgets);
+    CheckDlgButton(IDC_RESERVE_TASKBAR_SPACE_CHECK, m_data.reserve_taskbar_space);
     //EnableDlgCtrl(IDC_AVOID_OVERLAP_RIGHT_WIDGETS_CHECK, CWindowsSettingHelper::IsTaskbarWidgetsBtnShown());
     m_widgets_width_edit.SetRange(0, 300);
     m_widgets_width_edit.SetValue(m_data.taskbar_left_space_win11);
@@ -104,6 +105,7 @@ void CWin11TaskbarSettingDlg::OnOK()
     m_data.ValidWindowOffsetLeft();
 
     m_data.avoid_overlap_with_widgets = (IsDlgButtonChecked(IDC_AVOID_OVERLAP_RIGHT_WIDGETS_CHECK) != 0);
+    m_data.reserve_taskbar_space = (IsDlgButtonChecked(IDC_RESERVE_TASKBAR_SPACE_CHECK) != 0);
 
     m_data.taskbar_left_space_win11 = m_widgets_width_edit.GetValue();
     if (m_data.taskbar_left_space_win11 < 0)
