@@ -1078,6 +1078,17 @@ public:
 
     static auto GetDefaultBlendFunctionPointer() noexcept
         -> const ::PBLENDFUNCTION;
+
+    //设置整个窗口的不透明度（0到255）。这个值会乘到每个像素的alpha上。
+    //这条路径是用UpdateLayeredWindowIndirect呈现的，绝不能改用
+    //SetLayeredWindowAttributes来调不透明度：这两个接口是互斥的，
+    //一旦调用了后者，前者就会一直失败，程序会误以为D2D不可用而退回GDI绘图。
+    //Set the whole-window opacity (0-255); it multiplies each pixel's alpha. This path presents
+    //through UpdateLayeredWindowIndirect, so opacity must NEVER be set with
+    //SetLayeredWindowAttributes instead: the two are mutually exclusive, and once the latter
+    //has been called the former fails forever, which makes the app conclude D2D is broken and
+    //fall back to GDI rendering.
+    static void SetConstantAlpha(BYTE alpha) noexcept;
 };
 
 class CTaskBarDlgDrawBufferUseDComposition : public IDrawBuffer

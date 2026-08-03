@@ -1900,6 +1900,11 @@ auto CTaskBarDlgDrawBuffer::GetDefaultBlendFunctionPointer() noexcept
     return &result;
 }
 
+void CTaskBarDlgDrawBuffer::SetConstantAlpha(BYTE alpha) noexcept
+{
+    GetDefaultBlendFunctionPointer()->SourceConstantAlpha = alpha;
+}
+
 CTaskBarDlgDrawCommon::CGdiInteropObject::CGdiInteropObject(D2D1_SIZE_U size)
 {
     m_gdi_interop_cdc.CreateCompatibleDC(NULL);
