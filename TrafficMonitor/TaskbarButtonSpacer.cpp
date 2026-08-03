@@ -1,311 +1,588 @@
 ﻿#include "stdafx.h"
 #include "TaskbarButtonSpacer.h"
-#include <dwmapi.h>
 #include <uiautomation.h>
-#include <atlbase.h>
-#include <initguid.h>
-#include <propkey.h>
-#include <propvarutil.h>
-#include <shobjidl.h>
+#include <shellapi.h>
+#include <strsafe.h>
+#include <algorithm>
 
-#pragma comment(lib, "dwmapi.lib")
+CTaskbarTrayReserve* CTaskbarTrayReserve::m_instance{};
 
-CTaskbarButtonSpacer* CTaskbarButtonSpacer::m_instance{};
+//占位图标宿主窗口的窗口类名 / window class of the hidden icon-owner window
+static const wchar_t* TRAY_RESERVE_WINDOW_CLASS = L"TrafficMonitorTrayReserve";
+//占位图标的提示文本。故意取一个独一无二的名字，便于在UI自动化中找出它们。
+//Tooltip of the placeholder icons - deliberately unique so UI Automation can find them.
+static const wchar_t* TRAY_RESERVE_TIP = L"TrafficMonitor reserved space";
+//存放通知区域图标显示设置的注册表路径 / registry path for tray icon visibility
+static const wchar_t* NOTIFY_ICON_SETTINGS_KEY = L"Control Panel\\NotifyIconSettings";
 
+GUID CTaskbarTrayReserve::MakeIconGuid(int index)
+{
+    //每个槽位使用一个固定的GUID，序号放在最后两个字节里，
+    //这样重启之后同一个槽位仍然对应注册表中的同一项。
+    //One fixed GUID per slot, with the index in the last two bytes, so a slot maps to the
+    //same registry entry across restarts instead of littering a new one every launch.
+    GUID guid{ 0x7f3a9c41, 0x6d18, 0x4b52, { 0x9e, 0x64, 0xa1, 0x27, 0x00, 0x00 } };
+    guid.Data4[6] = static_cast<unsigned char>((index >> 8) & 0xFF);
+    guid.Data4[7] = static_cast<unsigned char>(index & 0xFF);
+    return guid;
+}
 
-//占位窗口的窗口类名
-static const wchar_t* SPACER_WINDOW_CLASS = L"TrafficMonitorTaskbarSpacer";
-//占位窗口标题使用的空白字符（盲文空格U+2800，在任务栏按钮标签中显示为空白）
-static const wchar_t SPACER_TITLE_CHAR = L'⠀';
-#ifndef DWMWA_CLOAK
-#define DWMWA_CLOAK 13
-#endif
+//创建一个完全透明的图标，使占位图标在通知区域中不可见
+//A fully transparent icon, so the placeholders are invisible in the tray
+static HICON CreateBlankTrayIcon()
+{
+    const int size = 32;
+    HDC screen_dc = ::GetDC(nullptr);
+    if (screen_dc == nullptr)
+        return nullptr;
+    HICON result{};
+    BITMAPINFO bi{};
+    bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bi.bmiHeader.biWidth = size;
+    bi.bmiHeader.biHeight = -size;
+    bi.bmiHeader.biPlanes = 1;
+    bi.bmiHeader.biBitCount = 32;
+    bi.bmiHeader.biCompression = BI_RGB;
+    void* bits{};
+    HBITMAP color = CreateDIBSection(screen_dc, &bi, DIB_RGB_COLORS, &bits, nullptr, 0);
+    if (color != nullptr)
+    {
+        if (bits != nullptr)
+            memset(bits, 0, static_cast<size_t>(size) * size * 4);  //alpha 0 everywhere
+        //掩码必须显式填成全1（表示完全透明）。传nullptr时掩码未初始化，
+        //取到0的位会被画成实心黑块，通知区域里就会出现一排黑方块。
+        //The AND mask must be explicitly filled with 1s (= fully transparent). Passing
+        //nullptr leaves it uninitialised, and zeroed mask bits draw as solid black squares
+        //in the tray instead of nothing at all.
+        const int mask_stride = ((size + 15) / 16) * 2;             //1bpp rows are WORD aligned
+        std::vector<BYTE> mask_bits(static_cast<size_t>(mask_stride) * size, 0xFF);
+        HBITMAP mask = CreateBitmap(size, size, 1, 1, mask_bits.data());
+        if (mask != nullptr)
+        {
+            ICONINFO ii{};
+            ii.fIcon = TRUE;
+            ii.hbmColor = color;
+            ii.hbmMask = mask;
+            result = CreateIconIndirect(&ii);
+            DeleteObject(mask);
+        }
+        DeleteObject(color);
+    }
+    ::ReleaseDC(nullptr, screen_dc);
+    return result;
+}
 
-CTaskbarButtonSpacer::~CTaskbarButtonSpacer()
+CTaskbarTrayReserve::~CTaskbarTrayReserve()
 {
     Destroy();
 }
 
-CString CTaskbarButtonSpacer::GetSpacerTitle(int index)
+bool CTaskbarTrayReserve::EnsureWindow()
 {
-    //每个占位窗口的标题使用不同数量的空白字符，便于在UI自动化接口中区分每个按钮
-    return CString(SPACER_TITLE_CHAR, index + 1);
-}
+    if (m_wnd != nullptr && ::IsWindow(m_wnd))
+        return true;
 
-HICON CTaskbarButtonSpacer::CreateTransparentIcon()
-{
-    //创建一个32x32的完全透明的图标
-    const int size = 32;
-    BITMAPV5HEADER bi{};
-    bi.bV5Size = sizeof(BITMAPV5HEADER);
-    bi.bV5Width = size;
-    bi.bV5Height = size;
-    bi.bV5Planes = 1;
-    bi.bV5BitCount = 32;
-    bi.bV5Compression = BI_BITFIELDS;
-    bi.bV5RedMask = 0x00FF0000;
-    bi.bV5GreenMask = 0x0000FF00;
-    bi.bV5BlueMask = 0x000000FF;
-    bi.bV5AlphaMask = 0xFF000000;
-
-    HDC hdc = ::GetDC(nullptr);
-    void* bits{};
-    HBITMAP color_bitmap = CreateDIBSection(hdc, reinterpret_cast<BITMAPINFO*>(&bi), DIB_RGB_COLORS, &bits, nullptr, 0);
-    ::ReleaseDC(nullptr, hdc);
-    if (color_bitmap == nullptr)
-        return nullptr;
-    if (bits != nullptr)
-    {
-        //所有像素都设置为alpha为1的黑色。
-        //如果所有像素的alpha都为0，图标会被系统当作没有alpha通道的旧式图标处理，显示为黑色方块；
-        //而只把个别像素的alpha设置为非0值，缩放图标时该像素会被放大成一个可见的小点。
-        //这里让整个图标都使用一个极小的alpha值（不透明度约0.4%），既能被识别为带alpha通道的图标，
-        //又不会显示出任何可见的内容
-        BYTE* pixel = static_cast<BYTE*>(bits);
-        for (int i = 0; i < size * size; i++)
-        {
-            pixel[i * 4 + 0] = 0;   //B
-            pixel[i * 4 + 1] = 0;   //G
-            pixel[i * 4 + 2] = 0;   //R
-            pixel[i * 4 + 3] = 1;   //A
-        }
-    }
-    //掩码位图所有位都为1（透明）。注意不能使用未初始化的掩码
-    std::vector<BYTE> mask_bits(size * size / 8, 0xFF);
-    HBITMAP mask_bitmap = CreateBitmap(size, size, 1, 1, mask_bits.data());
-
-    ICONINFO icon_info{};
-    icon_info.fIcon = TRUE;
-    icon_info.hbmColor = color_bitmap;
-    icon_info.hbmMask = mask_bitmap;
-    HICON icon = CreateIconIndirect(&icon_info);
-
-    DeleteObject(color_bitmap);
-    DeleteObject(mask_bitmap);
-    return icon;
-}
-
-void CTaskbarButtonSpacer::RegisterSpacerWindowClass()
-{
     static bool registered{ false };
-    if (registered)
-        return;
-    //设置完全透明的图标，使任务栏按钮显示为空白
-    HICON transparent_icon = CreateTransparentIcon();
-    WNDCLASSEXW wc{};
-    wc.cbSize = sizeof(WNDCLASSEXW);
-    wc.lpfnWndProc = DefWindowProcW;
-    wc.hInstance = AfxGetInstanceHandle();
-    wc.lpszClassName = SPACER_WINDOW_CLASS;
-    wc.hIcon = transparent_icon;
-    wc.hIconSm = transparent_icon;
-    RegisterClassExW(&wc);
-    registered = true;
+    if (!registered)
+    {
+        WNDCLASSEXW wc{};
+        wc.cbSize = sizeof(WNDCLASSEXW);
+        wc.lpfnWndProc = DefWindowProcW;
+        wc.hInstance = AfxGetInstanceHandle();
+        wc.lpszClassName = TRAY_RESERVE_WINDOW_CLASS;
+        RegisterClassExW(&wc);
+        registered = true;
+    }
+    //一个真实存在、但从不显示的顶层窗口。绝对不能用仅消息窗口：
+    //外壳会拒绝由HWND_MESSAGE窗口发起的Shell_NotifyIcon，导致每次添加图标都失败。
+    //A real (but never shown) top-level window. This must NOT be a message-only window:
+    //the shell rejects Shell_NotifyIcon from HWND_MESSAGE owners, so every add failed.
+    //WS_EX_TOOLWINDOW keeps it out of the taskbar and Alt+Tab.
+    m_wnd = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE, TRAY_RESERVE_WINDOW_CLASS,
+        L"", WS_POPUP, 0, 0, 1, 1, nullptr, nullptr, AfxGetInstanceHandle(), nullptr);
+    if (m_wnd == nullptr)
+        return false;
+    if (m_icon == nullptr)
+        m_icon = CreateBlankTrayIcon();
+
+    //清理上一次运行遗留下来的占位图标注册表项。正常退出时Destroy()会清理，
+    //但崩溃或者被强制结束进程时不会，这些残留会一直堆积在用户的设置里。
+    //Delete placeholder entries left over by a previous run. Destroy() cleans up on a normal
+    //exit, but a crash or a force-kill skips it, and those orphans would otherwise pile up in
+    //the notification-area settings forever.
+    HKEY root{};
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, NOTIFY_ICON_SETTINGS_KEY, 0, KEY_READ | KEY_SET_VALUE, &root) == ERROR_SUCCESS)
+    {
+        for (const auto& name : EnumNotifyIconKeys())
+        {
+            HKEY sub{};
+            if (RegOpenKeyExW(root, name.c_str(), 0, KEY_READ, &sub) != ERROR_SUCCESS)
+                continue;
+            wchar_t tip[256]{};
+            DWORD size = sizeof(tip);
+            DWORD type{};
+            const bool is_ours = (RegQueryValueExW(sub, L"InitialTooltip", nullptr, &type,
+                reinterpret_cast<LPBYTE>(tip), &size) == ERROR_SUCCESS
+                && type == REG_SZ && wcscmp(tip, TRAY_RESERVE_TIP) == 0);
+            RegCloseKey(sub);
+            if (is_ours)
+                RegDeleteKeyW(root, name.c_str());
+        }
+        RegCloseKey(root);
+    }
+    return true;
 }
 
-HWND CTaskbarButtonSpacer::CreateSpacerWindow(int index)
+std::vector<std::wstring> CTaskbarTrayReserve::EnumNotifyIconKeys()
 {
-    RegisterSpacerWindowClass();
-    //创建一个位于屏幕外的小窗口。WS_EX_APPWINDOW确保窗口显示在任务栏中
-    HWND hwnd = CreateWindowExW(WS_EX_APPWINDOW, SPACER_WINDOW_CLASS, GetSpacerTitle(index).GetString(),
-        WS_POPUP, -32000, -32000, 1, 1, nullptr, nullptr, AfxGetInstanceHandle(), nullptr);
-    if (hwnd == nullptr)
-        return nullptr;
-    //为窗口设置带序号和代数的AppUserModelID。
-    //任务栏按照AppUserModelID记忆按钮的位置，如果不设置，重新创建的窗口的按钮会回到原来的位置；
-    //设置一个新的AppUserModelID后，任务栏会把按钮排列到所有按钮的最右侧。
-    //每个窗口使用不同的AppUserModelID，防止在“合并任务栏按钮”开启时占位按钮被合并成一个
-    CString app_id;
-    app_id.Format(L"TrafficMonitor.TaskbarSpacer.%d.%u", index, m_generation);
-    CComPtr<IPropertyStore> property_store;
-    if (SUCCEEDED(SHGetPropertyStoreForWindow(hwnd, IID_PPV_ARGS(&property_store))))
+    std::vector<std::wstring> keys;
+    HKEY key{};
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, NOTIFY_ICON_SETTINGS_KEY, 0, KEY_READ, &key) != ERROR_SUCCESS)
+        return keys;
+    wchar_t name[256]{};
+    DWORD index{};
+    DWORD name_len = ARRAYSIZE(name);
+    while (RegEnumKeyExW(key, index, name, &name_len, nullptr, nullptr, nullptr, nullptr) == ERROR_SUCCESS)
     {
-        PROPVARIANT var;
-        if (SUCCEEDED(InitPropVariantFromString(app_id.GetString(), &var)))
+        keys.push_back(name);
+        index++;
+        name_len = ARRAYSIZE(name);
+    }
+    RegCloseKey(key);
+    return keys;
+}
+
+bool CTaskbarTrayReserve::PromoteIcon(const std::vector<std::wstring>& keys_before)
+{
+    //Find the key that just appeared and mark it always-visible. Its name must be recorded:
+    //removing an icon only blanks the key's values and leaves the empty key behind, so
+    //matching on contents (e.g. ExecutablePath) during cleanup would silently find nothing.
+    bool promoted{ false };
+    for (const auto& name : EnumNotifyIconKeys())
+    {
+        if (std::find(keys_before.begin(), keys_before.end(), name) != keys_before.end())
+            continue;
+        std::wstring path{ NOTIFY_ICON_SETTINGS_KEY };
+        path += L"\\";
+        path += name;
+        HKEY key{};
+        if (RegOpenKeyExW(HKEY_CURRENT_USER, path.c_str(), 0, KEY_SET_VALUE, &key) == ERROR_SUCCESS)
         {
-            property_store->SetValue(PKEY_AppUserModel_ID, var);
-            property_store->Commit();
-            PropVariantClear(&var);
+            DWORD value = 1;
+            if (RegSetValueExW(key, L"IsPromoted", 0, REG_DWORD,
+                reinterpret_cast<const BYTE*>(&value), sizeof(value)) == ERROR_SUCCESS)
+            {
+                promoted = true;
+            }
+            RegCloseKey(key);
+        }
+        if (std::find(m_created_keys.begin(), m_created_keys.end(), name) == m_created_keys.end())
+            m_created_keys.push_back(name);
+    }
+    return promoted;
+}
+
+bool CTaskbarTrayReserve::FindKeyForIcon(int index, std::wstring& key_name)
+{
+    const GUID guid = MakeIconGuid(index);
+    wchar_t wanted[64]{};
+    StringFromGUID2(guid, wanted, ARRAYSIZE(wanted));
+
+    HKEY root{};
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, NOTIFY_ICON_SETTINGS_KEY, 0, KEY_READ, &root) != ERROR_SUCCESS)
+        return false;
+    bool found{};
+    for (const auto& name : EnumNotifyIconKeys())
+    {
+        HKEY sub{};
+        if (RegOpenKeyExW(root, name.c_str(), 0, KEY_READ, &sub) != ERROR_SUCCESS)
+            continue;
+        wchar_t value[64]{};
+        DWORD size = sizeof(value);
+        DWORD type{};
+        if (RegQueryValueExW(sub, L"IconGuid", nullptr, &type, reinterpret_cast<LPBYTE>(value), &size) == ERROR_SUCCESS
+            && type == REG_SZ && _wcsicmp(value, wanted) == 0)
+        {
+            key_name = name;
+            found = true;
+        }
+        RegCloseKey(sub);
+        if (found)
+            break;
+    }
+    RegCloseKey(root);
+    return found;
+}
+
+void CTaskbarTrayReserve::EnsurePromoted()
+{
+    if (m_pending_promote.empty())
+        return;
+    std::vector<int> still_pending;
+    for (int index : m_pending_promote)
+    {
+        std::wstring key_name;
+        if (!FindKeyForIcon(index, key_name))
+        {
+            //Explorer has not written the key yet - try again on the next call
+            still_pending.push_back(index);
+            continue;
+        }
+        std::wstring path{ NOTIFY_ICON_SETTINGS_KEY };
+        path += L"\\";
+        path += key_name;
+        HKEY key{};
+        if (RegOpenKeyExW(HKEY_CURRENT_USER, path.c_str(), 0, KEY_READ | KEY_SET_VALUE, &key) != ERROR_SUCCESS)
+        {
+            still_pending.push_back(index);
+            continue;
+        }
+        DWORD promoted{};
+        DWORD size = sizeof(promoted);
+        DWORD type{};
+        const bool already = (RegQueryValueExW(key, L"IsPromoted", nullptr, &type,
+            reinterpret_cast<LPBYTE>(&promoted), &size) == ERROR_SUCCESS && promoted == 1);
+        if (!already)
+        {
+            DWORD value = 1;
+            RegSetValueExW(key, L"IsPromoted", 0, REG_DWORD,
+                reinterpret_cast<const BYTE*>(&value), sizeof(value));
+        }
+        RegCloseKey(key);
+
+        if (std::find(m_created_keys.begin(), m_created_keys.end(), key_name) == m_created_keys.end())
+            m_created_keys.push_back(key_name);
+
+        if (!already)
+        {
+            //Re-add so the shell picks the new visibility up; it only reads this when the
+            //icon is registered.
+            NOTIFYICONDATAW nid{};
+            nid.cbSize = sizeof(nid);
+            nid.hWnd = m_wnd;
+            nid.uFlags = NIF_ICON | NIF_TIP | NIF_GUID;
+            nid.guidItem = MakeIconGuid(index);
+            nid.hIcon = m_icon;
+            StringCchCopyW(nid.szTip, ARRAYSIZE(nid.szTip), TRAY_RESERVE_TIP);
+            Shell_NotifyIconW(NIM_DELETE, &nid);
+            Shell_NotifyIconW(NIM_ADD, &nid);
         }
     }
-    ::ShowWindow(hwnd, SW_SHOWNOACTIVATE);
-    //使用DWM将窗口隐藏（Cloak）。窗口在屏幕、Alt+Tab和任务视图中都不可见，
-    //但任务栏中的按钮仍然保留（与挂起的UWP应用保持任务栏按钮的机制相同）
-    BOOL cloak = TRUE;
-    DwmSetWindowAttribute(hwnd, DWMWA_CLOAK, &cloak, sizeof(cloak));
-    return hwnd;
+    m_pending_promote = std::move(still_pending);
 }
 
-void CALLBACK CTaskbarButtonSpacer::WinEventProc(HWINEVENTHOOK hook, DWORD event, HWND hwnd, LONG id_object, LONG id_child, DWORD event_thread, DWORD event_time)
+bool CTaskbarTrayReserve::AddIcon(int index)
 {
-    //任务栏布局发生了变化，立即唤醒后台查询线程
+    if (!EnsureWindow())
+        return false;
+
+    NOTIFYICONDATAW nid{};
+    nid.cbSize = sizeof(nid);
+    nid.hWnd = m_wnd;
+    nid.uFlags = NIF_ICON | NIF_TIP | NIF_GUID;
+    nid.guidItem = MakeIconGuid(index);
+    nid.hIcon = m_icon;
+    StringCchCopyW(nid.szTip, ARRAYSIZE(nid.szTip), TRAY_RESERVE_TIP);
+
+    //Step 1: add once so Windows creates the registry entry. That entry does not exist until
+    //the icon has been added at least once, so IsPromoted cannot simply be written up front.
+    const std::vector<std::wstring> keys_before = EnumNotifyIconKeys();
+    if (!Shell_NotifyIconW(NIM_ADD, &nid))
+    {
+        //The GUID may still be held by an instance that did not exit cleanly - drop it and retry
+        Shell_NotifyIconW(NIM_DELETE, &nid);
+        if (!Shell_NotifyIconW(NIM_ADD, &nid))
+            return false;
+    }
+
+    //Step 2: mark the new entry always-visible, then delete and re-add so it takes effect.
+    //Without this the icon sits in the "Show Hidden Icons" flyout and reserves nothing at all.
+    if (PromoteIcon(keys_before))
+    {
+        Shell_NotifyIconW(NIM_DELETE, &nid);
+        Shell_NotifyIconW(NIM_ADD, &nid);
+    }
+    else
+    {
+        //The key was not there yet. Explorer writes it asynchronously, so retry the
+        //promotion later - otherwise this icon stays in the hidden flyout and reserves
+        //nothing, and the region never becomes wide enough to hold the window.
+        m_pending_promote.push_back(index);
+    }
+    return true;
+}
+
+void CTaskbarTrayReserve::RemoveIcon(int index)
+{
+    NOTIFYICONDATAW nid{};
+    nid.cbSize = sizeof(nid);
+    nid.hWnd = m_wnd;
+    nid.uFlags = NIF_GUID;
+    nid.guidItem = MakeIconGuid(index);
+    Shell_NotifyIconW(NIM_DELETE, &nid);
+}
+
+void CTaskbarTrayReserve::RefineSlotWidth(int reserved_width, int icon_count)
+{
+    if (icon_count <= 0 || reserved_width <= 0)
+        return;
+    const int measured = reserved_width / icon_count;
+    if (measured <= 0)
+        return;
+    //只允许把估计值改小。改大会导致图标变少、区域变窄、估计值又变大，
+    //形成来回震荡，通知区域和窗口都会不停抖动。
+    //Only ever narrow the estimate. Growing it would reduce the icon count, shrink the
+    //region and re-grow the estimate - the oscillation that made the tray thrash before.
+    if (m_slot_width == 0 || measured < m_slot_width)
+        m_slot_width = measured;
+}
+
+int CTaskbarTrayReserve::GetSlotWidth() const
+{
+    //Once the icons are on screen their real pitch is known; trust it over the DPI guess.
+    //GetDeviceCaps reports 144 on this machine while tray icons are genuinely 42px apart,
+    //so the guess alone under-reserves by a third and the window never fits the region.
+    if (m_slot_width > 0)
+        return m_slot_width;
+    UINT dpi = 96;
+    HDC dc = ::GetDC(nullptr);
+    if (dc != nullptr)
+    {
+        dpi = static_cast<UINT>(GetDeviceCaps(dc, LOGPIXELSX));
+        ::ReleaseDC(nullptr, dc);
+    }
+    const int slot = ICON_SLOT_WIDTH * static_cast<int>(dpi) / 96;
+    return slot > 0 ? slot : ICON_SLOT_WIDTH;
+}
+
+void CTaskbarTrayReserve::SetReservedWidth(int width)
+{
+    //Catch up on any icon whose always-visible flag could not be written when it was added
+    EnsurePromoted();
+
+    //Correct the slot estimate from the icons that are actually on screen
+    {
+        std::lock_guard<std::mutex> lock(m_rect_mutex);
+        if (m_reserved_valid)
+            RefineSlotWidth(m_reserved_rect.Width(), m_reserved_count);
+    }
+
+    int target{};
+    if (width > 0)
+    {
+        const int slot = GetSlotWidth();
+        //向上取整：多预留一点无伤大雅，少预留则会让窗口放不进预留区域，
+        //结果又压回到任务栏按钮上。
+        //Round up: reserving slightly more than asked for is harmless, whereas reserving less
+        //means the window does not fit the region and lands back on top of taskbar buttons.
+        target = (width + slot - 1) / slot;
+        if (target > MAX_ICONS)
+            target = MAX_ICONS;
+    }
+
+    if (target != static_cast<int>(m_icons.size()))
+    {
+        const ULONGLONG now = GetTickCount64();
+        //Only attempt to grow if we are not in a back-off window and have not given up.
+        //Without this a persistent failure is retried on every timer tick, and because each
+        //attempt adds, promotes, deletes and re-adds an icon, the whole tray flickers.
+        //Back off after a failure, but never give up for good: adds fail transiently while
+        //the shell is rebuilding the tray, and stopping permanently leaves the region too
+        //small forever, so the window can never move onto it.
+        const bool may_add = (now >= m_retry_after);
+        //每次只增加一个图标，而不是一口气全部添加。连续添加时外壳会丢掉一部分，
+        //而且所有图标同时出现会让通知区域明显抖动。调用方是定时器驱动的，仍然很快能填满。
+        //Grow by a single icon per call rather than in one burst. Adding a handful in a tight
+        //loop makes the shell drop some of them, and the tray visibly thrashes while they all
+        //appear at once. The caller runs on a timer, so the region still fills in quickly.
+        if (may_add && static_cast<int>(m_icons.size()) < target)
+        {
+            const int index = static_cast<int>(m_icons.size());
+            if (AddIcon(index))
+            {
+                m_failed_attempts = 0;
+                m_icons.push_back(index);
+            }
+            else
+            {
+                m_failed_attempts++;
+                const int steps = (m_failed_attempts < MAX_BACKOFF_STEPS)
+                    ? m_failed_attempts : MAX_BACKOFF_STEPS;
+                m_retry_after = now + RETRY_COOLDOWN * steps;
+            }
+        }
+        while (static_cast<int>(m_icons.size()) > target)
+        {
+            const int index = m_icons.back();
+            RemoveIcon(index);
+            m_icons.pop_back();
+            m_pending_promote.erase(
+                std::remove(m_pending_promote.begin(), m_pending_promote.end(), index),
+                m_pending_promote.end());
+        }
+        m_icon_count = static_cast<int>(m_icons.size());
+        {
+            //The count changed, so the cached region no longer describes reality
+            std::lock_guard<std::mutex> lock(m_rect_mutex);
+            m_reserved_valid = false;
+        }
+    }
+
+    if (!m_icons.empty())
+        EnsureQueryThread();
+}
+
+bool CTaskbarTrayReserve::GetReservedRect(CRect& rect) const
+{
+    std::lock_guard<std::mutex> lock(m_rect_mutex);
+    if (!m_reserved_valid)
+        return false;
+    rect = m_reserved_rect;
+    return true;
+}
+
+void CALLBACK CTaskbarTrayReserve::WinEventProc(HWINEVENTHOOK hook, DWORD event, HWND hwnd,
+    LONG id_object, LONG id_child, DWORD event_thread, DWORD event_time)
+{
+    //The taskbar layout changed - wake the query thread at once
     if (m_instance != nullptr && m_instance->m_wake_event != nullptr)
         SetEvent(m_instance->m_wake_event);
 }
 
-void CTaskbarButtonSpacer::EnsureQueryThread()
+void CTaskbarTrayReserve::EnsureQueryThread()
 {
     if (m_query_thread.joinable())
         return;
     m_thread_exit = false;
     if (m_wake_event == nullptr)
         m_wake_event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
-    //安装WinEvent钩子，在任务栏布局变化时立即唤醒后台查询线程。
-    //使用WINEVENT_OUTOFCONTEXT模式，事件在本进程中接收，不会向Explorer注入任何代码
     if (m_win_event_hook == nullptr)
     {
-        HWND hTaskbar = ::FindWindowW(L"Shell_TrayWnd", nullptr);
-        DWORD taskbar_process_id{};
-        if (hTaskbar != nullptr)
-            ::GetWindowThreadProcessId(hTaskbar, &taskbar_process_id);
+        HWND taskbar = ::FindWindowW(L"Shell_TrayWnd", nullptr);
+        DWORD pid{};
+        if (taskbar != nullptr)
+            ::GetWindowThreadProcessId(taskbar, &pid);
         m_instance = this;
-        m_win_event_hook = SetWinEventHook(EVENT_OBJECT_CREATE, EVENT_OBJECT_LOCATIONCHANGE, nullptr, WinEventProc,
-            taskbar_process_id, 0, WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
+        //OUTOFCONTEXT: events arrive in our own process; nothing is injected into Explorer
+        m_win_event_hook = SetWinEventHook(EVENT_OBJECT_CREATE, EVENT_OBJECT_LOCATIONCHANGE,
+            nullptr, WinEventProc, pid, 0, WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
     }
-    m_query_thread = std::thread(&CTaskbarButtonSpacer::QueryThreadProc, this);
+    m_query_thread = std::thread(&CTaskbarTrayReserve::QueryThreadProc, this);
 }
 
-void CTaskbarButtonSpacer::QueryThreadProc()
+void CTaskbarTrayReserve::QueryThreadProc()
 {
-    //在MTA中初始化COM，UI自动化的调用不会抽取界面线程的消息队列
+    //COM in an MTA: UI Automation's cross-process calls pump the message queue, which would
+    //re-enter the UI thread if this ran there.
     CoInitializeEx(nullptr, COINIT_MULTITHREADED);
     {
         CComPtr<IUIAutomation> uia;
-        CoCreateInstance(__uuidof(CUIAutomation), nullptr, CLSCTX_INPROC_SERVER, __uuidof(IUIAutomation), reinterpret_cast<void**>(&uia));
-        std::vector<CRect> last_rects;
+        CoCreateInstance(__uuidof(CUIAutomation), nullptr, CLSCTX_INPROC_SERVER,
+            __uuidof(IUIAutomation), reinterpret_cast<void**>(&uia));
+
+        CRect last_rect;
         int stable_count{};
         int query_interval{ QUERY_INTERVAL_FAST };
-        ULONGLONG last_query_tick{};
         while (!m_thread_exit)
         {
-            last_query_tick = GetTickCount64();
-            int count = m_window_count;
-            if (uia != nullptr && count > 0)
+            const ULONGLONG query_start = GetTickCount64();
+            const int expected = m_icon_count;
+
+            CRect union_rect;
+            int found{};
+            if (uia != nullptr && expected > 0)
             {
-                std::vector<CRect> rects(count);
-                std::vector<CRect> foreign_rects;   //其它程序的任务栏按钮的矩形区域
-                //查找任务栏中的所有按钮
-                HWND hTaskbar = ::FindWindowW(L"Shell_TrayWnd", nullptr);
+                HWND taskbar = ::FindWindowW(L"Shell_TrayWnd", nullptr);
+                CRect rc_taskbar;
+                const bool taskbar_ok = (taskbar != nullptr
+                    && ::GetWindowRect(taskbar, rc_taskbar) && !rc_taskbar.IsRectEmpty());
                 CComPtr<IUIAutomationElement> taskbar_element;
-                if (hTaskbar != nullptr && SUCCEEDED(uia->ElementFromHandle(hTaskbar, &taskbar_element)) && taskbar_element != nullptr)
+                if (taskbar_ok && SUCCEEDED(uia->ElementFromHandle(taskbar, &taskbar_element))
+                    && taskbar_element != nullptr)
                 {
                     CComPtr<IUIAutomationCondition> condition;
                     VARIANT var{};
-                    var.vt = VT_I4;
-                    var.lVal = UIA_ButtonControlTypeId;
-                    CComPtr<IUIAutomationElementArray> buttons;
-                    if (SUCCEEDED(uia->CreatePropertyCondition(UIA_ControlTypePropertyId, var, &condition))
-                        && SUCCEEDED(taskbar_element->FindAll(TreeScope_Descendants, condition, &buttons)) && buttons != nullptr)
+                    var.vt = VT_BSTR;
+                    var.bstrVal = SysAllocString(TRAY_RESERVE_TIP);
+                    CComPtr<IUIAutomationElementArray> elements;
+                    if (var.bstrVal != nullptr
+                        && SUCCEEDED(uia->CreatePropertyCondition(UIA_NamePropertyId, var, &condition))
+                        && SUCCEEDED(taskbar_element->FindAll(TreeScope_Descendants, condition, &elements))
+                        && elements != nullptr)
                     {
-                        int button_count{};
-                        buttons->get_Length(&button_count);
-                        for (int i = 0; i < button_count; i++)
+                        int length{};
+                        elements->get_Length(&length);
+                        for (int i = 0; i < length; i++)
                         {
-                            CComPtr<IUIAutomationElement> button;
-                            if (FAILED(buttons->GetElement(i, &button)) || button == nullptr)
+                            CComPtr<IUIAutomationElement> element;
+                            if (FAILED(elements->GetElement(i, &element)) || element == nullptr)
                                 continue;
-                            CComBSTR name;
-                            if (FAILED(button->get_CurrentName(&name)) || name == nullptr)
-                                continue;
-                            //按钮名称以窗口标题开头（后面可能跟有系统附加的说明文字）。
-                            //统计名称开头的标题字符数量即可得到对应的占位窗口序号
-                            CString name_str(name);
-                            int char_count{};
-                            while (char_count < name_str.GetLength() && name_str[char_count] == SPACER_TITLE_CHAR)
-                                char_count++;
-                            int index = char_count - 1;
                             RECT rc{};
-                            if (FAILED(button->get_CurrentBoundingRectangle(&rc)))
+                            if (FAILED(element->get_CurrentBoundingRectangle(&rc)))
                                 continue;
-                            if (index >= 0 && index < count)
-                                rects[index] = rc;
-                            else if (index < 0)
-                                foreign_rects.push_back(CRect(rc));
-                        }
-                    }
-                }
-                //检查是否有其它程序的任务栏按钮出现在占位按钮的右侧（只检查任务按钮区域中的按钮，
-                //即完全位于通知区域左侧的按钮，排除通知区域图标、时钟等）
-                bool foreign_on_right{ false };
-                LONG leftmost_spacer{ LONG_MAX };
-                bool all_spacers_found{ true };
-                for (const auto& rc : rects)
-                {
-                    if (rc.IsRectEmpty())
-                        all_spacers_found = false;
-                    else if (rc.left < leftmost_spacer)
-                        leftmost_spacer = rc.left;
-                }
-                if (all_spacers_found && count > 0)
-                {
-                    CRect rc_notify;
-                    HWND hNotify = ::FindWindowExW(hTaskbar, nullptr, L"TrayNotifyWnd", nullptr);
-                    if (hNotify != nullptr && ::GetWindowRect(hNotify, rc_notify))
-                    {
-                        for (const auto& rc : foreign_rects)
-                        {
-                            //跳过通知区域中的按钮（托盘图标、“显示隐藏的图标”按钮、时钟等）。
-                            //只要按钮延伸到了通知区域的左边界右侧，就认为它属于通知区域。
-                            //注意不能只判断按钮的左边界：“显示隐藏的图标”按钮的左边界
-                            //可能比TrayNotifyWnd的左边界小一两个像素，
-                            //只判断左边界会把它当成任务按钮，导致一直误判为有按钮位于占位按钮右侧
-                            if (rc.IsRectEmpty() || rc.right > rc_notify.left)
+                            //Discard nonsense: while the taskbar is being moved, UI Automation
+                            //briefly returns empty rects and elements that are not inside it at
+                            //all. Trusting those throws the window off-screen.
+                            if (rc.right <= rc.left || rc.bottom <= rc.top)
                                 continue;
-                            //其它程序的按钮进入了占位按钮的区域或者位于占位按钮的右侧
-                            if (rc.right > leftmost_spacer)
-                            {
-                                foreign_on_right = true;
-                                break;
-                            }
+                            CRect rc_hit;
+                            if (!rc_hit.IntersectRect(rc_taskbar, CRect(rc)))
+                                continue;
+                            if (found == 0)
+                                union_rect = rc;
+                            else
+                                union_rect.UnionRect(union_rect, CRect(rc));
+                            found++;
                         }
                     }
-                }
-                //检测到有按钮进入占位按钮的区域时立即通知任务栏窗口，
-                //使窗口不必等待定时器的下一次触发就能重新调整位置
-                bool was_foreign_on_right = m_foreign_on_right.exchange(foreign_on_right);
-                if (foreign_on_right && !was_foreign_on_right)
-                {
-                    HWND notify_wnd = m_notify_wnd;
-                    if (notify_wnd != nullptr && ::IsWindow(notify_wnd))
-                        ::PostMessageW(notify_wnd, WM_SPACER_LAYOUT_CHANGED, 0, 0);
-                }
-                //保存查询结果
-                {
-                    std::lock_guard<std::mutex> lock(m_rects_mutex);
-                    m_button_rects = rects;
-                }
-                //根据任务栏布局是否稳定调整查询间隔：
-                //布局连续多次没有变化时使用较长的间隔以节省电量，布局变化时立即切换回较短的间隔
-                bool rects_changed = (rects.size() != last_rects.size());
-                if (!rects_changed)
-                {
-                    for (size_t i = 0; i < rects.size(); i++)
-                    {
-                        if (rects[i] != last_rects[i])
-                        {
-                            rects_changed = true;
-                            break;
-                        }
-                    }
-                }
-                last_rects = rects;
-                if (rects_changed || foreign_on_right)
-                {
-                    stable_count = 0;
-                    query_interval = QUERY_INTERVAL_FAST;
-                }
-                else if (++stable_count >= STABLE_COUNT_FOR_SLOW)
-                {
-                    query_interval = QUERY_INTERVAL_SLOW;
+                    VariantClear(&var);
                 }
             }
-            //等待下一次查询。任务栏布局变化时会被WinEvent钩子立即唤醒，否则按当前间隔轮询
+
+            //Use whatever placeholders are genuinely on screen. Requiring all of them to be
+            //found makes the region permanently invalid whenever a single icon lags behind or
+            //stays hidden, and the window then never moves onto the space that does exist.
+            //The caller checks the width, so a partially filled region simply fits less.
+            const bool valid = (found > 0 && !union_rect.IsRectEmpty());
+            bool changed{};
+            {
+                std::lock_guard<std::mutex> lock(m_rect_mutex);
+                changed = (valid != m_reserved_valid) || (valid && union_rect != m_reserved_rect);
+                m_reserved_valid = valid;
+                if (valid)
+                {
+                    m_reserved_rect = union_rect;
+                    //Dividing the region by the number of icons that actually form it is the
+                    //only way to get the true slot pitch. Using the requested count instead
+                    //under-measures whenever an icon is still hidden, and the estimate then
+                    //spirals down and over-reserves.
+                    m_reserved_count = found;
+                }
+            }
+            if (changed)
+            {
+                HWND notify = m_notify_wnd;
+                if (notify != nullptr && ::IsWindow(notify))
+                    ::PostMessageW(notify, WM_SPACER_LAYOUT_CHANGED, 0, 0);
+            }
+
+            //Lengthen the interval once the position settles; snap back the moment it moves
+            if (changed || union_rect != last_rect)
+            {
+                stable_count = 0;
+                query_interval = QUERY_INTERVAL_FAST;
+            }
+            else if (++stable_count >= STABLE_COUNT_FOR_SLOW)
+            {
+                query_interval = QUERY_INTERVAL_SLOW;
+            }
+            last_rect = union_rect;
+
             if (m_wake_event != nullptr)
             {
                 WaitForSingleObject(m_wake_event, query_interval);
-                //限制查询频率：任务栏动画期间钩子会产生大量事件，
-                //这里保证两次查询之间至少间隔MIN_QUERY_GAP，避免频繁查询占用CPU
-                ULONGLONG elapsed = GetTickCount64() - last_query_tick;
+                //Throttle: taskbar animations make the hook fire a flood of events
+                const ULONGLONG elapsed = GetTickCount64() - query_start;
                 if (!m_thread_exit && elapsed < MIN_QUERY_GAP)
                     Sleep(static_cast<DWORD>(MIN_QUERY_GAP - elapsed));
             }
@@ -319,158 +596,61 @@ void CTaskbarButtonSpacer::QueryThreadProc()
     CoUninitialize();
 }
 
-void CTaskbarButtonSpacer::SetRequiredWidth(int width)
+void CTaskbarTrayReserve::Destroy()
 {
-    m_required_width = width;
-
-    //清理已经失效的窗口（例如用户通过任务栏右键菜单关闭了窗口），下面会重新创建
-    for (auto& hwnd : m_windows)
-    {
-        if (hwnd != nullptr && !::IsWindow(hwnd))
-            hwnd = nullptr;
-    }
-
-    //测量单个占位按钮的宽度。
-    //只接受合理范围内的宽度：任务栏按钮的宽度不会小于按钮的高度的一半，也不会超过按钮高度的3倍。
-    //如果使用了不合理的宽度（例如任务栏正在重新布局时查询到的中间状态），
-    //计算得到的占位按钮数量会过多，在任务栏中留下一大片空白
-    {
-        std::lock_guard<std::mutex> lock(m_rects_mutex);
-        for (const auto& rc : m_button_rects)
-        {
-            if (!rc.IsRectEmpty() && rc.Width() > 0 && rc.Height() > 0
-                && rc.Width() * 2 >= rc.Height() && rc.Width() <= rc.Height() * 3)
-            {
-                m_measured_button_width = rc.Width();
-                break;
-            }
-        }
-    }
-
-    //计算需要的按钮数量（单个按钮宽度未知时先创建一个按钮用于测量）。
-    //这里使用四舍五入而不是向上取整：向上取整时预留的区域可能比任务栏窗口宽很多，
-    //窗口覆盖不到的部分会在任务栏上留下一片空白
-    int target_count{ 1 };
-    if (m_measured_button_width > 0)
-        target_count = (width + m_measured_button_width / 2) / m_measured_button_width;
-    if (target_count > MAX_SPACER_BUTTONS)
-        target_count = MAX_SPACER_BUTTONS;
-    if (target_count < 1)
-        target_count = 1;
-
-    //创建缺少的窗口
-    while (static_cast<int>(m_windows.size()) < target_count)
-        m_windows.push_back(CreateSpacerWindow(static_cast<int>(m_windows.size())));
-    //重新创建已经失效的窗口
-    for (size_t i = 0; i < m_windows.size(); i++)
-    {
-        if (m_windows[i] == nullptr)
-            m_windows[i] = CreateSpacerWindow(static_cast<int>(i));
-    }
-    //移除多余的窗口
-    while (static_cast<int>(m_windows.size()) > target_count)
-    {
-        if (m_windows.back() != nullptr)
-            ::DestroyWindow(m_windows.back());
-        m_windows.pop_back();
-    }
-    m_window_count = static_cast<int>(m_windows.size());
-
-    //如果有其它程序的任务栏按钮出现在占位按钮的右侧（例如新打开的窗口，
-    //或者用户把其它按钮拖动到了占位按钮的右侧），使用新的AppUserModelID重新创建占位窗口。
-    //任务栏把使用新AppUserModelID的窗口当作新启动的应用程序，按钮总是排列在所有按钮的最右侧，
-    //因此占位按钮（以及显示在它上面的任务栏窗口）会立即回到任务按钮区域的最右侧
-    if (m_foreign_on_right && !m_windows.empty())
-    {
-        ULONGLONG current_tick = GetTickCount64();
-        if (current_tick - m_last_recreate_tick > RECREATE_COOLDOWN)
-        {
-            m_last_recreate_tick = current_tick;
-            m_foreign_on_right = false;
-            m_generation++;
-            //先创建新的占位窗口，再销毁原来的窗口，
-            //使任务按钮区域中始终存在占位按钮，避免任务栏按钮的位置来回变化
-            std::vector<HWND> old_windows{ m_windows };
-            for (size_t i = 0; i < m_windows.size(); i++)
-                m_windows[i] = CreateSpacerWindow(static_cast<int>(i));
-            for (HWND hwnd : old_windows)
-            {
-                if (hwnd != nullptr)
-                    ::DestroyWindow(hwnd);
-            }
-        }
-    }
-
-    //启动后台查询线程
-    EnsureQueryThread();
-}
-
-bool CTaskbarButtonSpacer::GetReservedRect(CRect& rect) const
-{
-    if (m_windows.empty())
-        return false;
-    std::vector<CRect> rects;
-    {
-        std::lock_guard<std::mutex> lock(m_rects_mutex);
-        rects = m_button_rects;
-    }
-    if (rects.size() != m_windows.size())
-        return false;
-    CRect union_rect;
-    int total_width{};
-    for (size_t i = 0; i < m_windows.size(); i++)
-    {
-        if (m_windows[i] == nullptr)
-            return false;
-        const CRect& rc = rects[i];
-        if (rc.IsRectEmpty())
-            return false;
-        total_width += rc.Width();
-        if (union_rect.IsRectEmpty())
-            union_rect = rc;
-        else
-            union_rect.UnionRect(union_rect, rc);
-    }
-    //如果并集的宽度明显大于所有按钮宽度之和，说明占位按钮中间夹杂了其它程序的按钮，
-    //此时不能使用这个区域，否则会遮挡其它程序的按钮
-    if (m_measured_button_width > 0 && union_rect.Width() > total_width + m_measured_button_width)
-        return false;
-    rect = union_rect;
-    return true;
-}
-
-void CTaskbarButtonSpacer::Destroy()
-{
-    //移除WinEvent钩子
-    if (m_win_event_hook != nullptr)
-    {
-        UnhookWinEvent(m_win_event_hook);
-        m_win_event_hook = nullptr;
-    }
-    m_instance = nullptr;
-    //停止后台查询线程
+    m_thread_exit = true;
+    if (m_wake_event != nullptr)
+        SetEvent(m_wake_event);
     if (m_query_thread.joinable())
-    {
-        m_thread_exit = true;
-        if (m_wake_event != nullptr)
-            SetEvent(m_wake_event);
         m_query_thread.join();
-    }
     if (m_wake_event != nullptr)
     {
         CloseHandle(m_wake_event);
         m_wake_event = nullptr;
     }
-    for (HWND hwnd : m_windows)
+    if (m_win_event_hook != nullptr)
     {
-        if (hwnd != nullptr && ::IsWindow(hwnd))
-            ::DestroyWindow(hwnd);
+        UnhookWinEvent(m_win_event_hook);
+        m_win_event_hook = nullptr;
     }
-    m_windows.clear();
-    m_window_count = 0;
+    if (m_instance == this)
+        m_instance = nullptr;
+
+    for (int index : m_icons)
+        RemoveIcon(index);
+    m_icons.clear();
+    m_icon_count = 0;
+
+    //按记录下来的键名删除注册表项。删除图标时系统只会清空键里的值、
+    //把空键留在原地，靠内容匹配是找不到它们的。
+    //Delete the registry entries by recorded name. Removing an icon only blanks the values
+    //and leaves an empty key behind, which content matching would never find.
+    if (!m_created_keys.empty())
     {
-        std::lock_guard<std::mutex> lock(m_rects_mutex);
-        m_button_rects.clear();
+        HKEY key{};
+        if (RegOpenKeyExW(HKEY_CURRENT_USER, NOTIFY_ICON_SETTINGS_KEY, 0, KEY_SET_VALUE, &key) == ERROR_SUCCESS)
+        {
+            for (const auto& name : m_created_keys)
+                RegDeleteKeyW(key, name.c_str());
+            RegCloseKey(key);
+        }
+        m_created_keys.clear();
     }
-    m_measured_button_width = 0;
+
+    if (m_wnd != nullptr)
+    {
+        if (::IsWindow(m_wnd))
+            ::DestroyWindow(m_wnd);
+        m_wnd = nullptr;
+    }
+    if (m_icon != nullptr)
+    {
+        DestroyIcon(m_icon);
+        m_icon = nullptr;
+    }
+    {
+        std::lock_guard<std::mutex> lock(m_rect_mutex);
+        m_reserved_valid = false;
+        m_reserved_rect.SetRectEmpty();
+    }
 }

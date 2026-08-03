@@ -1,4 +1,4 @@
-﻿#pragma once
+#pragma once
 #include "TaskBarDlg.h"
 #include "TaskbarButtonSpacer.h"
 class CWin11TaskbarDlg :
@@ -9,43 +9,51 @@ public:
 
 protected:
     afx_msg void OnTimer(UINT_PTR nIDEvent);
-    //占位按钮的位置需要调整时立即调整任务栏窗口的位置
+    //Reposition the taskbar window as soon as the reserved region moves
     afx_msg LRESULT OnSpacerLayoutChanged(WPARAM wParam, LPARAM lParam);
     DECLARE_MESSAGE_MAP()
 
 private:
-    //用于跟踪占位按钮位置变化的定时器。
-    //占位按钮的位置发生变化时，后台线程会立即发送WM_SPACER_LAYOUT_CHANGED消息来调整窗口位置，
-    //这个定时器只作为兜底手段，因此使用较长的间隔以减少耗电
+    //Timer that tracks the reserved region. The background thread posts
+    //WM_SPACER_LAYOUT_CHANGED on any change, so this is only a backstop - hence the long
+    //interval, which keeps power use down.
     static constexpr UINT_PTR SPACER_ADJUST_TIMER = 1961;
     static constexpr UINT SPACER_ADJUST_INTERVAL = 1000;
-    //预留空间暂时失效时（例如任务栏正在重新布局），保持窗口位置不变的最大次数，
-    //避免窗口在预留位置和原来的位置之间来回跳动
-    static constexpr int SPACER_FAIL_GRACE_COUNT = 20;
-    // 通过 CTaskBarDlg 继承
+    //Extra padding reserved around the window (logical px, DPI scaled) so its contents do
+    //not sit flush against the neighbouring tray icons
+    static constexpr int RESERVE_PADDING = 8;
+
+    // inherited from CTaskBarDlg
     void InitTaskbarWnd() override;
     virtual void AdjustTaskbarWndPos(bool force_adjust) override;
     void ResetTaskbarPos() override;
     virtual HWND GetParentHwnd() override;
+    void CheckTaskbarOnTopOrBottom() override;
 
-    //在启用了“为任务栏窗口预留空间”时通过通知区域占位图标预留空间，
-    //成功预留时把窗口移动到预留区域上并返回true，否则返回false
-    bool AdjustWndPosBySpacer(bool force_adjust);
+    //Reserve space in the tray and place the window in it. Returns true once the window has
+    //been placed; returns false while the reserved region has not appeared yet, so the
+    //caller falls back to the original placement.
+    bool UpdateTrayReserve();
 
-    HWND m_hNotify;     //任务栏通知区域的句柄
-    HWND m_hStart;      //开始按钮的句柄
-    CRect m_rcNotify;   //任务栏通知区域的矩形区域
-    CRect m_rcStart;     //开始按钮的矩形区域
+    //Whether to leave room for widgets on the right. Driven purely by the user's checkbox:
+    //widget detection relies on a registry value that can read 0 even when widgets are
+    //shown, so second-guessing the user only makes the option do nothing.
+    bool IsAvoidingRightWidgets() const;
+    //Whether to move the window to the taskbar's left side. Only when the taskbar is
+    //centred, the option is ticked, AND the free space there fits the whole window -
+    //otherwise it stays on the right rather than overlapping any button.
+    bool ShouldMoveToLeftForWidgets() const;
+
+    HWND m_hNotify;     //handle of the notification area
+    HWND m_hStart;      //handle of the Start button
+    CRect m_rcNotify;   //rect of the notification area
+    CRect m_rcStart;    //rect of the Start button
     int m_last_notify_width{};
     int m_last_start_pos{};
 
-    CTaskbarButtonSpacer m_button_spacer;   //任务栏占位按钮，用于为任务栏窗口预留空间
-    bool m_positioned_by_spacer{ false };   //窗口当前是否位于占位按钮预留的位置上
-    int m_spacer_fail_count{};              //连续获取预留区域失败的次数
-    bool m_spacer_timer_started{ false };   //跟踪占位按钮位置的定时器是否已启动
-
-    // 通过 CTaskBarDlg 继承
-    void CheckTaskbarOnTopOrBottom() override;
-
+    //Placeholder tray icons reserving the space
+    CTaskbarTrayReserve m_tray_reserve;
+    bool m_tray_timer_started{ false };
+    //Where the reserved region was last time we placed the window, to detect movement
+    CRect m_last_reserved_rect{ 0, 0, 0, 0 };
 };
-
