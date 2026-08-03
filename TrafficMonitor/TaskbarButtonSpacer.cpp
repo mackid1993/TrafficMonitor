@@ -489,6 +489,7 @@ void CTaskbarTrayReserve::QueryThreadProc()
             const int expected = m_icon_count;
 
             CRect union_rect;
+            std::vector<CRect> others;      //别人的托盘图标 / other programs' tray icons
             int found{};
             if (uia != nullptr && expected > 0)
             {
@@ -500,13 +501,21 @@ void CTaskbarTrayReserve::QueryThreadProc()
                 if (taskbar_ok && SUCCEEDED(uia->ElementFromHandle(taskbar, &taskbar_element))
                     && taskbar_element != nullptr)
                 {
+                    //枚举任务栏里所有的按钮，而不是只找自己的占位图标。
+                    //只找自己的就看不见别人：用户可以把别的程序的托盘图标拖到占位块中间，
+                    //那个图标落在预留区域里面，窗口一摆上去就正好把它盖住，
+                    //既看不见也点不到。要发现这种情况，就必须知道区域里还有没有别人的图标。
+                    //Enumerate every button in the taskbar, not just our own placeholders.
+                    //Looking only for our own makes other icons invisible to us: the user can
+                    //drag another program's tray icon into the middle of the placeholder block,
+                    //where it lands inside the reserved region and the window covers it - unable
+                    //to be seen or clicked. Spotting that requires knowing what else is in there.
                     CComPtr<IUIAutomationCondition> condition;
                     VARIANT var{};
-                    var.vt = VT_BSTR;
-                    var.bstrVal = SysAllocString(TRAY_RESERVE_TIP);
+                    var.vt = VT_I4;
+                    var.lVal = UIA_ButtonControlTypeId;
                     CComPtr<IUIAutomationElementArray> elements;
-                    if (var.bstrVal != nullptr
-                        && SUCCEEDED(uia->CreatePropertyCondition(UIA_NamePropertyId, var, &condition))
+                    if (SUCCEEDED(uia->CreatePropertyCondition(UIA_ControlTypePropertyId, var, &condition))
                         && SUCCEEDED(taskbar_element->FindAll(TreeScope_Descendants, condition, &elements))
                         && elements != nullptr)
                     {
@@ -528,11 +537,25 @@ void CTaskbarTrayReserve::QueryThreadProc()
                             CRect rc_hit;
                             if (!rc_hit.IntersectRect(rc_taskbar, CRect(rc)))
                                 continue;
-                            if (found == 0)
-                                union_rect = rc;
+                            //用"包含"而不是"完全相等"来认自己的图标：外壳有可能在提示文本
+                            //前后加上别的内容，严格相等就会一个也认不出来。
+                            //Match by substring rather than exact equality: the shell may
+                            //decorate the tooltip, and strict equality would recognise none.
+                            CComBSTR name;
+                            const bool is_ours = (SUCCEEDED(element->get_CurrentName(&name))
+                                && name != nullptr && wcsstr(name, TRAY_RESERVE_TIP) != nullptr);
+                            if (is_ours)
+                            {
+                                if (found == 0)
+                                    union_rect = rc;
+                                else
+                                    union_rect.UnionRect(union_rect, CRect(rc));
+                                found++;
+                            }
                             else
-                                union_rect.UnionRect(union_rect, CRect(rc));
-                            found++;
+                            {
+                                others.push_back(CRect(rc));
+                            }
                         }
                     }
                     VariantClear(&var);
@@ -544,6 +567,32 @@ void CTaskbarTrayReserve::QueryThreadProc()
             //stays hidden, and the window then never moves onto the space that does exist.
             //The caller checks the width, so a partially filled region simply fits less.
             const bool valid = (found > 0 && !union_rect.IsRectEmpty());
+
+            //预留区域里有没有夹着别人的图标。通知区域的图标可以被用户拖动重排，
+            //别的程序的图标完全可能被拖到两个占位图标中间，落在预留区域内部。
+            //这时窗口如果照常摆上去，就正好把那个图标盖在下面——用户既看不见它，
+            //也点不到它，只能把窗口挪开才能取回。调用方发现这个标志就把窗口藏起来，
+            //图标被拖走之后标志自动清除，窗口再自己回来。
+            //Whether someone else's icon is sitting inside the reserved region. Tray icons can
+            //be reordered by dragging, so another program's icon can land between two
+            //placeholders, inside the region. Placing the window there as usual would cover that
+            //icon - invisible and unclickable until the window moves away. The caller hides the
+            //window while this is set; once the icon is dragged out it clears and the window
+            //comes back on its own.
+            bool obstructed{};
+            if (valid)
+            {
+                for (const CRect& other : others)
+                {
+                    CRect hit;
+                    if (hit.IntersectRect(union_rect, other) && !hit.IsRectEmpty())
+                    {
+                        obstructed = true;
+                        break;
+                    }
+                }
+            }
+            m_obstructed = obstructed;
             bool changed{};
             {
                 std::lock_guard<std::mutex> lock(m_rect_mutex);

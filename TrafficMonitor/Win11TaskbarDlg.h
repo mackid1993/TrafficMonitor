@@ -19,9 +19,14 @@ private:
     //interval, which keeps power use down.
     static constexpr UINT_PTR SPACER_ADJUST_TIMER = 1961;
     static constexpr UINT SPACER_ADJUST_INTERVAL = 1000;
-    //Extra padding reserved around the window (logical px, DPI scaled) so its contents do
-    //not sit flush against the neighbouring tray icons
-    static constexpr int RESERVE_PADDING = 8;
+    //窗口两侧额外预留的空白（逻辑像素，按DPI缩放），使内容不至于紧贴旁边的托盘图标。
+    //这个值要留得很小：预留区域是按整个图标槽位（约42像素）向上取整的，
+    //多留几像素就可能多占一整个槽位，反而在窗口两边留下很大的空隙。
+    //Extra padding reserved on each side of the window (logical px, DPI scaled) so its contents
+    //do not sit flush against the neighbouring tray icons. Keep this small: the region is
+    //rounded up to whole icon slots (~42px), so a few extra pixels can cost an entire slot and
+    //leave a conspicuous gap on both sides of the window.
+    static constexpr int RESERVE_PADDING = 2;
 
     // inherited from CTaskBarDlg
     void InitTaskbarWnd() override;
@@ -56,4 +61,14 @@ private:
     bool m_tray_timer_started{ false };
     //Where the reserved region was last time we placed the window, to detect movement
     CRect m_last_reserved_rect{ 0, 0, 0, 0 };
+    //窗口是否已经按普通方式摆放过一次。还没摆放过时m_rect仍是初始的{0,0,宽,高}，
+    //也就是任务栏最左端。"保持原位"那条分支会照着这个矩形显示窗口，于是窗口压在
+    //开始按钮上面，而且一直压到预留区域建成为止——建不成就是永远。
+    //资源管理器重启时对话框会被销毁重建，走的正是这条路径。
+    //Whether the window has been placed the ordinary way at least once. Before that m_rect is
+    //still its initial {0,0,w,h} - the far left of the taskbar. The hold branch shows the window
+    //at that rect, so it covers the Start button until the reserved region is built, which is
+    //forever if the reservation never completes. An Explorer restart destroys and rebuilds this
+    //dialog and takes exactly that path.
+    bool m_fallback_placed{ false };
 };

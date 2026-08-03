@@ -20,6 +20,19 @@ void CWin11TaskbarDlg::AdjustTaskbarWndPos(bool force_adjust)
             SetTimer(SPACER_ADJUST_TIMER, SPACER_ADJUST_INTERVAL, nullptr);
             m_tray_timer_started = true;
         }
+        //有别的图标被拖进了预留区域里。这时把窗口藏起来，绝不能照常摆上去——
+        //摆上去就正好盖在那个图标上面，用户既看不见它也点不到它，
+        //看起来就像图标被卡在窗口底下了。图标被拖走之后自动恢复显示。
+        //Another icon has been dragged into the reserved region. Hide the window rather than
+        //placing it as usual: placing it would cover that icon, which could then be neither
+        //seen nor clicked - it looks like the icon is trapped underneath. It comes back by
+        //itself once the icon is dragged away.
+        if (m_tray_reserve.IsInited() && m_tray_reserve.IsObstructed())
+        {
+            if (IsWindowVisible())
+                ShowWindow(SW_HIDE);
+            return;
+        }
         //Once the placeholders exist the window sits on them and nothing else applies
         if (UpdateTrayReserve())
             return;
@@ -27,7 +40,12 @@ void CWin11TaskbarDlg::AdjustTaskbarWndPos(bool force_adjust)
         //back: every icon added widens the tray, which moves the fallback target, so
         //recomputing it each tick makes the window skitter across the taskbar while the
         //region grows. Only give up and re-place once reservation has actually failed.
-        if (m_tray_reserve.IsInited())
+        //只有在窗口已经正常摆放过一次之后，"保持原位"才有意义。第一次进来时m_rect还是
+        //初始值{0,0,宽,高}，保持原位等于把窗口钉在任务栏最左端、压住开始按钮。
+        //Holding only makes sense once the window has been placed normally at least once. On the
+        //first pass m_rect is still {0,0,w,h}, so holding pins the window to the far left of the
+        //taskbar, covering the Start button.
+        if (m_tray_reserve.IsInited() && m_fallback_placed)
         {
             if (!IsWindowVisible())
                 ShowWindow(SW_SHOWNA);
@@ -99,6 +117,9 @@ void CWin11TaskbarDlg::AdjustTaskbarWndPos(bool force_adjust)
             + DPI(theApp.m_taskbar_data.window_offset_top));
 
         MoveWindow(m_rect);
+        //到这里m_rect才是真正算出来的位置，从现在起"保持原位"才是安全的
+        //Only now is m_rect a genuinely computed position, so holding it is safe from here on
+        m_fallback_placed = true;
     }
 }
 

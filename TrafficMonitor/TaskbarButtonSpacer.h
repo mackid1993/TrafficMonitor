@@ -57,6 +57,14 @@ public:
 
     bool IsInited() const { return !m_icons.empty(); }
 
+    //预留区域里是否夹着别的程序的托盘图标。为true时调用方应当把窗口藏起来，
+    //否则窗口正好盖在那个图标上面，用户看不见也点不到它。
+    //图标被拖走之后这个标志会自动清除，窗口随即恢复显示。
+    //Whether another program's tray icon is sitting inside the reserved region. While true the
+    //caller should hide the window; otherwise it covers that icon, which can then be neither
+    //seen nor clicked. It clears by itself once the icon is dragged away, and the window returns.
+    bool IsObstructed() const { return m_obstructed; }
+
     //移除所有占位图标，并清理它们在注册表中留下的键
     //Remove every placeholder icon and clean up the registry keys they left behind
     void Destroy();
@@ -149,6 +157,9 @@ private:
     std::atomic<bool> m_thread_exit{ false };
     std::atomic<int> m_icon_count{ 0 };         //供后台线程读取 / read by the background thread
     std::atomic<HWND> m_notify_wnd{};
+    //预留区域内是否夹着别人的图标，由后台线程写、界面线程读
+    //Whether a foreign icon lies inside the region; written by the query thread, read by the UI
+    std::atomic<bool> m_obstructed{ false };
     HANDLE m_wake_event{};
     HWINEVENTHOOK m_win_event_hook{};
     static CTaskbarTrayReserve* m_instance;     //供WinEvent回调使用 / for the WinEvent callback
