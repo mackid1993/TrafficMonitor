@@ -21,7 +21,8 @@ void CWin11TaskbarDlg::AdjustTaskbarWndPos(bool force_adjust)
         theApp.m_taskbar_data.tbar_wnd_snap,
         theApp.m_taskbar_data.taskbar_left_space_win11,
         theApp.m_taskbar_data.window_offset_left,
-        theApp.m_taskbar_data.window_offset_top };
+        theApp.m_taskbar_data.window_offset_top,
+        GetDPI() };
     if (!m_settings_captured || current != m_last_settings)
     {
         m_last_settings = current;
@@ -185,6 +186,11 @@ bool CWin11TaskbarDlg::UpdateTrayReserve()
     }
 
     m_tray_reserve.SetNotifyWindow(GetSafeHwnd());
+    //把当前显示器的DPI交给它。接扩展坞、拔扩展坞、把窗口挪到缩放比例不同的屏上时，
+    //托盘图标的间距会跟着变，估计值必须重新量过。
+    //Hand it this monitor's DPI. Docking, undocking or moving to a differently scaled screen
+    //changes the tray icon pitch, and the estimate has to be re-measured.
+    m_tray_reserve.SetDpi(GetDPI());
     //按窗口实际需要的宽度预留，两边各留一点空白。
     //这里用的是实际算出来的窗口宽度，因此无论配置了多少个显示项目都能自动适应。
     //Reserve whatever the window actually needs, plus a little breathing room on each side.

@@ -473,20 +473,33 @@ void CTaskbarTrayReserve::RefineSlotWidth(int reserved_width, int icon_count)
         m_slot_width = measured;
 }
 
-int CTaskbarTrayReserve::GetDpiSeedWidth()
+void CTaskbarTrayReserve::SetDpi(UINT dpi)
 {
-    UINT dpi = 96;
-    HDC dc = ::GetDC(nullptr);
-    if (dc != nullptr)
-    {
-        dpi = static_cast<UINT>(GetDeviceCaps(dc, LOGPIXELSX));
-        ::ReleaseDC(nullptr, dc);
-    }
-    const int slot = ICON_SLOT_WIDTH * static_cast<int>(dpi) / 96;
+    if (dpi == 0 || dpi == m_dpi)
+        return;
+    m_dpi = dpi;
+    //换了显示器（或缩放比例变了）：上一块屏量出来的间距在这里完全不适用，
+    //而且这个估计值只会往小改，不清掉的话永远回不到正确的值——
+    //接上低DPI的屏时会当成图标还很宽、图标加得太少，区域不够宽窗口就放不进去；
+    //反过来则会加得太多、白占一大片通知区域。清空后按新的DPI重新估、重新量。
+    //A different monitor or scale factor: the pitch measured on the previous screen simply does
+    //not apply, and since the estimate only ever narrows it can never climb back on its own -
+    //attaching a lower-DPI screen leaves it believing icons are still wide, so too few are added
+    //and the region is never wide enough to hold the window; the reverse over-reserves a large
+    //strip of the tray. Clear it and re-seed and re-measure at the new DPI.
+    m_slot_width = 0;
+    std::lock_guard<std::mutex> lock(m_rect_mutex);
+    m_reserved_valid = false;
+    m_reserved_count = 0;
+}
+
+int CTaskbarTrayReserve::GetDpiSeedWidth() const
+{
+    const int slot = ICON_SLOT_WIDTH * static_cast<int>(m_dpi) / 96;
     return slot > 0 ? slot : ICON_SLOT_WIDTH;
 }
 
-int CTaskbarTrayReserve::GetSlotWidthFloor()
+int CTaskbarTrayReserve::GetSlotWidthFloor() const
 {
     //取按DPI估算值的一半作为下限。实测这个估算值偏大（本机估63，实际42），
     //所以一半（31）既容得下真实的间距，又能挡住重复计数造成的偏小值（28及以下）。

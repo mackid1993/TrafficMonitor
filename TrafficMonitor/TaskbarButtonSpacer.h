@@ -65,6 +65,19 @@ public:
     //seen nor clicked. It clears by itself once the icon is dragged away, and the window returns.
     bool IsObstructed() const { return m_obstructed; }
 
+    //告知当前显示器的DPI。必须由调用方传进来：这里自己去问只能拿到系统DPI，
+    //而接上不同缩放比例的显示器（比如扩展坞外接屏）时，真正要用的是那块屏的DPI。
+    //通知区域图标的间距是随DPI变的，而间距的估计值只会往小改、不会自己变大，
+    //所以换了DPI必须把它清空重新量一遍，否则会沿用上一块屏的间距，
+    //算出来的图标个数不对，窗口就摆不到正确的位置上。
+    //Tell it the current monitor's DPI. This has to come from the caller: asking here only ever
+    //yields the system DPI, whereas what matters when a differently-scaled monitor is attached
+    //(a dock, say) is that monitor's DPI. Tray icon pitch scales with DPI, and the pitch estimate
+    //only ever narrows and never grows back, so on a DPI change it must be cleared and
+    //re-measured - otherwise it keeps the previous monitor's pitch, computes the wrong icon
+    //count, and the window no longer lands in the right place.
+    void SetDpi(UINT dpi);
+
     //移除所有占位图标，并清理它们在注册表中留下的键
     //Remove every placeholder icon and clean up the registry keys they left behind
     //移除所有占位图标。purge_keys为true时连同注册表里的项一起删掉——
@@ -196,9 +209,9 @@ private:
     int GetSlotWidth() const;
     void RefineSlotWidth(int reserved_width, int icon_count);
     //按DPI缩放的初始估计值 / the DPI-scaled starting guess
-    static int GetDpiSeedWidth();
+    int GetDpiSeedWidth() const;
     //测量值的下限，低于此值的样本一律丢弃 / floor below which a sample is discarded
-    static int GetSlotWidthFloor();
+    int GetSlotWidthFloor() const;
 
     //启动在后台查询占位图标位置的线程 / start the background position-query thread
     void EnsureQueryThread();
@@ -238,6 +251,8 @@ private:
     HWINEVENTHOOK m_win_event_hook{};
     static CTaskbarTrayReserve* m_instance;     //供WinEvent回调使用 / for the WinEvent callback
 
+    //当前显示器的DPI，由调用方设置 / current monitor's DPI, supplied by the caller
+    UINT m_dpi{ 96 };
     mutable int m_slot_width{};                 //未测量时为0 / 0 until measured
     int m_reserved_count{};                     //构成预留区域的图标数 / icons forming the region
     std::vector<int> m_pending_promote;         //已添加但尚未确认始终显示 / awaiting promotion

@@ -84,12 +84,18 @@ private:
         int widgets_width{};
         int offset_left{};
         int offset_top{};
+        //DPI也算在内：接上缩放比例不同的显示器时任务栏几何并不一定变化，
+        //不把它算进来的话，窗口会按旧DPI的位置一直停着不动。
+        //DPI counts too: attaching a differently scaled monitor does not necessarily change the
+        //taskbar geometry, and without it the window just stays put at the old DPI's position.
+        UINT dpi{};
         bool operator!=(const PlacementSettings& other) const
         {
             return reserve != other.reserve || avoid_widgets != other.avoid_widgets
                 || on_left != other.on_left || snap != other.snap
                 || widgets_width != other.widgets_width
-                || offset_left != other.offset_left || offset_top != other.offset_top;
+                || offset_left != other.offset_left || offset_top != other.offset_top
+                || dpi != other.dpi;
         }
     };
     PlacementSettings m_last_settings{};
