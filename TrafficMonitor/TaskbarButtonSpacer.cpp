@@ -656,7 +656,17 @@ void CTaskbarTrayReserve::SetReservedWidth(int width)
     }
 
     if (!m_icons.empty())
+    {
         EnsureQueryThread();
+        //钩子可能因为当时找不到任务栏而没挂上（见EnsureWinEventHook），这里每次都补一下：
+        //已经挂上的话它立刻返回，没挂上就再试。现在只有它才能让窗口即时跟上托盘的变化，
+        //不能只在启动线程和资源管理器重启时各试一次。
+        //The hook may have been skipped because the taskbar could not be found at that moment (see
+        //EnsureWinEventHook), so retry here on every call: it returns at once when already installed.
+        //It is now the only thing that lets the window follow a tray change immediately, so trying
+        //once at thread start and once on Explorer restart is not enough.
+        EnsureWinEventHook();
+    }
 }
 
 bool CTaskbarTrayReserve::GetReservedRect(CRect& rect) const
@@ -671,9 +681,31 @@ bool CTaskbarTrayReserve::GetReservedRect(CRect& rect) const
 void CALLBACK CTaskbarTrayReserve::WinEventProc(HWINEVENTHOOK hook, DWORD event, HWND hwnd,
     LONG id_object, LONG id_child, DWORD event_thread, DWORD event_time)
 {
-    //The taskbar layout changed - wake the query thread at once
-    if (m_instance != nullptr && m_instance->m_wake_event != nullptr)
-        SetEvent(m_instance->m_wake_event);
+    //只有任务栏里某个窗口自身的变化（挪动、缩放、显示、隐藏）才值得去查一次。
+    //钩子送来的远不止这些：鼠标光标自己的位置变化（OBJID_CURSOR）、光标闪烁、
+    //弹出的缩略图和提示条，每一样都是一串事件，却没有一样和托盘的布局有关。
+    //以前每一件都把查询线程叫醒，于是只要资源管理器里有点动静，钩子就几乎一刻不停，
+    //查询也一直以最快的速度跑着，而每次查询都要资源管理器的任务栏线程来伺候，
+    //结果就是任务栏被拖得发卡。
+    //预留区域的任何变化都会体现为托盘窗口（TrayNotifyWnd）或任务栏本身的挪动、缩放，
+    //所以只放行任务栏里的窗口事件就够了；其余一概不理，周期轮询兜底。
+    //Only a change to a window inside the taskbar itself (moved, resized, shown, hidden) is
+    //worth a query. The hook delivers far more than that: the mouse cursor's own location
+    //changes (OBJID_CURSOR), caret blinks, thumbnails and tooltips popping up - each a burst of
+    //events, none of them related to the tray layout. Every one of them used to wake the query
+    //thread, so whenever anything at all happened in Explorer the hook practically never fell
+    //silent, the query ran flat out at its fastest rate, and since each query has to be
+    //serviced by Explorer's taskbar thread, the taskbar itself became sluggish.
+    //Any change to the reserved region shows up as a move or resize of the tray window
+    //(TrayNotifyWnd) or of the taskbar itself, so admitting only window events inside the
+    //taskbar is enough; everything else is ignored, and the periodic poll is the backstop.
+    if (id_object != OBJID_WINDOW || id_child != CHILDID_SELF || hwnd == nullptr)
+        return;
+    if (m_instance == nullptr || m_instance->m_wake_event == nullptr)
+        return;
+    if (::GetAncestor(hwnd, GA_ROOT) != m_instance->m_hooked_taskbar)
+        return;
+    SetEvent(m_instance->m_wake_event);
 }
 
 void CTaskbarTrayReserve::EnsureQueryThread()
@@ -693,20 +725,30 @@ void CTaskbarTrayReserve::EnsureWinEventHook()
         return;
     HWND taskbar = ::FindWindowW(L"Shell_TrayWnd", nullptr);
     DWORD pid{};
+    DWORD tid{};
     if (taskbar != nullptr)
-        ::GetWindowThreadProcessId(taskbar, &pid);
-    //找不到任务栏时进程号会是0，而0代表"挂到本会话的所有进程上"——那是个范围大得多的
-    //全局钩子，每个窗口的每个事件都会回调过来。资源管理器正在重启时恰好就找不到任务栏，
-    //所以这里必须直接放弃，等下一次心跳再挂。
-    //A missing taskbar leaves pid at 0, and 0 means "hook every process in the session" - a far
-    //broader hook that fires for every event of every window. The taskbar is exactly what is
-    //missing while Explorer is restarting, so bail out and try again on the next tick instead.
-    if (pid == 0)
+        tid = ::GetWindowThreadProcessId(taskbar, &pid);
+    //找不到任务栏时进程号和线程号都会是0，而0代表"挂到本会话的所有进程/线程上"——
+    //那是个范围大得多的全局钩子，每个窗口的每个事件都会回调过来。
+    //资源管理器正在重启时恰好就找不到任务栏，所以这里必须直接放弃，等下一次心跳再挂。
+    //A missing taskbar leaves both ids at 0, and 0 means "hook every process/thread in the
+    //session" - a far broader hook that fires for every event of every window. The taskbar is
+    //exactly what is missing while Explorer is restarting, so bail out and try again on the next
+    //tick instead.
+    if (pid == 0 || tid == 0)
         return;
     m_instance = this;
+    m_hooked_taskbar = taskbar;
+    //只挂任务栏所在的那一个线程，而不是整个资源管理器进程。资源管理器还跑着桌面和所有的
+    //文件资源管理器窗口，按进程挂钩会把它们的每一次滚动、每一次光标闪烁都送过来，
+    //每一件都把查询线程叫醒去扫一遍任务栏，任务栏就是这样被拖慢的。
+    //Hook only the taskbar's thread, not the whole Explorer process. Explorer also runs the
+    //desktop and every File Explorer window; hooking by process delivered each of their scrolls
+    //and caret blinks, and every one woke the query thread for a taskbar sweep - which is what
+    //was slowing the taskbar down.
     //OUTOFCONTEXT: events arrive in our own process; nothing is injected into Explorer
     m_win_event_hook = SetWinEventHook(EVENT_OBJECT_CREATE, EVENT_OBJECT_LOCATIONCHANGE,
-        nullptr, WinEventProc, pid, 0, WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
+        nullptr, WinEventProc, pid, tid, WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
 }
 
 void CTaskbarTrayReserve::QueryThreadProc()
@@ -719,7 +761,42 @@ void CTaskbarTrayReserve::QueryThreadProc()
         CoCreateInstance(__uuidof(CUIAutomation), nullptr, CLSCTX_INPROC_SERVER,
             __uuidof(IUIAutomation), reinterpret_cast<void**>(&uia));
 
-        CRect last_rect;
+        //把要读的属性一次性打包在查询里带回来。
+        //原来是先FindAll拿到元素列表，再对每个元素分别取一次名字、一次矩形——
+        //每一次都是一趟到资源管理器任务栏线程的跨进程往返。任务栏上有几十个按钮，
+        //再加上最多48个占位图标，一次查询就是一两百趟往返，而查询最快每秒五次，
+        //任务栏线程光是伺候这些调用就忙不过来，用起来明显发卡。
+        //改成缓存请求之后整次查询只有一趟往返：搜索在资源管理器那边就地完成，
+        //名字和矩形随结果一起打包送回来，之后全在本地读缓存。
+        //Ask for the properties up front, packed into the query itself. Previously FindAll
+        //fetched the element list and then each element's name and rectangle were read one call
+        //at a time - every one a cross-process round trip serviced by Explorer's taskbar thread.
+        //With a few dozen taskbar buttons plus up to 48 placeholders that is one to two hundred
+        //round trips per query, at up to five queries a second, and the taskbar thread spent so
+        //much time answering us that it became visibly sluggish. With a cache request the whole
+        //query is a single round trip: the search runs inside Explorer, the name and rectangle
+        //come back with the results, and everything after that is read locally.
+        CComPtr<IUIAutomationCacheRequest> cache_request;
+        CComPtr<IUIAutomationCondition> button_condition;
+        if (uia != nullptr)
+        {
+            if (SUCCEEDED(uia->CreateCacheRequest(&cache_request)) && cache_request != nullptr)
+            {
+                cache_request->AddProperty(UIA_NamePropertyId);
+                cache_request->AddProperty(UIA_BoundingRectanglePropertyId);
+                cache_request->put_TreeScope(TreeScope_Element);
+                //不需要拿着元素本身，也就不在资源管理器里留任何引用
+                //No live element is needed, so nothing stays referenced inside Explorer
+                cache_request->put_AutomationElementMode(AutomationElementMode_None);
+            }
+            VARIANT var{};
+            var.vt = VT_I4;
+            var.lVal = UIA_ButtonControlTypeId;
+            uia->CreatePropertyCondition(UIA_ControlTypePropertyId, var, &button_condition);
+            VariantClear(&var);
+        }
+
+        CRect last_rect{ 0, 0, 0, 0 };
         //连续测到被遮挡的次数 / consecutive samples that saw an overlap
         int obstruct_streak{};
         int stable_count{};
@@ -729,10 +806,10 @@ void CTaskbarTrayReserve::QueryThreadProc()
             const ULONGLONG query_start = GetTickCount64();
             const int expected = m_icon_count;
 
-            CRect union_rect;
+            CRect union_rect{ 0, 0, 0, 0 };
             std::vector<CRect> others;      //别人的托盘图标 / other programs' tray icons
             int found{};
-            if (uia != nullptr && expected > 0)
+            if (uia != nullptr && cache_request != nullptr && button_condition != nullptr && expected > 0)
             {
                 HWND taskbar = ::FindWindowW(L"Shell_TrayWnd", nullptr);
                 CRect rc_taskbar;
@@ -751,13 +828,9 @@ void CTaskbarTrayReserve::QueryThreadProc()
                     //drag another program's tray icon into the middle of the placeholder block,
                     //where it lands inside the reserved region and the window covers it - unable
                     //to be seen or clicked. Spotting that requires knowing what else is in there.
-                    CComPtr<IUIAutomationCondition> condition;
-                    VARIANT var{};
-                    var.vt = VT_I4;
-                    var.lVal = UIA_ButtonControlTypeId;
                     CComPtr<IUIAutomationElementArray> elements;
-                    if (SUCCEEDED(uia->CreatePropertyCondition(UIA_ControlTypePropertyId, var, &condition))
-                        && SUCCEEDED(taskbar_element->FindAll(TreeScope_Descendants, condition, &elements))
+                    if (SUCCEEDED(taskbar_element->FindAllBuildCache(TreeScope_Descendants,
+                            button_condition, cache_request, &elements))
                         && elements != nullptr)
                     {
                         int length{};
@@ -768,7 +841,7 @@ void CTaskbarTrayReserve::QueryThreadProc()
                             if (FAILED(elements->GetElement(i, &element)) || element == nullptr)
                                 continue;
                             RECT rc{};
-                            if (FAILED(element->get_CurrentBoundingRectangle(&rc)))
+                            if (FAILED(element->get_CachedBoundingRectangle(&rc)))
                                 continue;
                             //Discard nonsense: while the taskbar is being moved, UI Automation
                             //briefly returns empty rects and elements that are not inside it at
@@ -783,7 +856,7 @@ void CTaskbarTrayReserve::QueryThreadProc()
                             //Match by substring rather than exact equality: the shell may
                             //decorate the tooltip, and strict equality would recognise none.
                             CComBSTR name;
-                            const bool is_ours = (SUCCEEDED(element->get_CurrentName(&name))
+                            const bool is_ours = (SUCCEEDED(element->get_CachedName(&name))
                                 && name != nullptr && wcsstr(name, TRAY_RESERVE_TIP) != nullptr);
                             if (is_ours)
                             {
@@ -799,7 +872,6 @@ void CTaskbarTrayReserve::QueryThreadProc()
                             }
                         }
                     }
-                    VariantClear(&var);
                 }
             }
 
@@ -981,6 +1053,7 @@ void CTaskbarTrayReserve::Destroy(bool purge_keys)
         UnhookWinEvent(m_win_event_hook);
         m_win_event_hook = nullptr;
     }
+    m_hooked_taskbar = nullptr;
     if (m_instance == this)
         m_instance = nullptr;
 
