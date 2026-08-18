@@ -215,9 +215,9 @@ private:
 
     //启动在后台查询占位图标位置的线程 / start the background position-query thread
     void EnsureQueryThread();
-    //按当前资源管理器的进程号挂事件钩子；找不到任务栏时不挂，绝不退化成全局钩子
-    //Install the WinEvent hook against Explorer's current pid; installs nothing when the taskbar
-    //cannot be found, so it can never degrade into a session-wide hook
+    //只在任务栏所在的那一个线程上挂事件钩子；找不到任务栏时不挂，绝不退化成全局钩子
+    //Install the WinEvent hook against the taskbar's own thread only; installs nothing when the
+    //taskbar cannot be found, so it can never degrade into a session-wide hook
     void EnsureWinEventHook();
     //占位图标宿主窗口的窗口过程，用来接收任务栏重建的广播
     //Window procedure of the icon-owner window; receives the taskbar-rebuild broadcast
@@ -225,8 +225,11 @@ private:
     //资源管理器重启了，占位图标需要重新添加 / Explorer restarted; placeholders must be re-added
     std::atomic<bool> m_shell_restarted{ false };
     void QueryThreadProc();
-    //WinEvent钩子回调（WINEVENT_OUTOFCONTEXT模式，事件在本进程中接收，不会注入其它进程）
-    //WinEvent hook callback (OUTOFCONTEXT - received in our process, nothing is injected)
+    //WinEvent钩子回调（WINEVENT_OUTOFCONTEXT模式，事件在本进程中接收，不会注入其它进程）。
+    //只有任务栏里某个窗口自身的变化才会唤醒查询线程，其余事件一律忽略（见实现处的说明）。
+    //WinEvent hook callback (OUTOFCONTEXT - received in our process, nothing is injected). Only
+    //a change to a window inside the taskbar wakes the query thread; everything else is ignored
+    //(see the implementation for why).
     static void CALLBACK WinEventProc(HWINEVENTHOOK hook, DWORD event, HWND hwnd,
         LONG id_object, LONG id_child, DWORD event_thread, DWORD event_time);
 
@@ -249,6 +252,7 @@ private:
     std::atomic<bool> m_obstructed{ false };
     HANDLE m_wake_event{};
     HWINEVENTHOOK m_win_event_hook{};
+    HWND m_hooked_taskbar{};                    //钩子所挂的任务栏窗口 / the taskbar the hook watches
     static CTaskbarTrayReserve* m_instance;     //供WinEvent回调使用 / for the WinEvent callback
 
     //当前显示器的DPI，由调用方设置 / current monitor's DPI, supplied by the caller
