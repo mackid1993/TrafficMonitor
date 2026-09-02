@@ -261,6 +261,14 @@ bool CWin11TaskbarDlg::ShouldMoveToLeftForWidgets() const
     return m_window_width <= free_left;
 }
 
+bool CWin11TaskbarDlg::UseCompactOuterMargins() const
+{
+    //The tray-reservation path adds RESERVE_PADDING around the computed window width. Keeping
+    //CTaskBarDlg's outer item_space margins as well double-counts that edge padding and can push
+    //an otherwise fitting readout into one more whole tray slot.
+    return theApp.m_taskbar_data.reserve_taskbar_space && m_taskbar_on_top_or_bottom;
+}
+
 void CWin11TaskbarDlg::OnCancel()
 {
     //Drop the placeholder icons before the window goes away

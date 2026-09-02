@@ -44,6 +44,7 @@ private:
     void ResetTaskbarPos() override;
     virtual HWND GetParentHwnd() override;
     void CheckTaskbarOnTopOrBottom() override;
+    bool UseCompactOuterMargins() const override;
 
     //Reserve space in the tray and place the window in it. Returns true once the window has
     //been placed; returns false while the reserved region has not appeared yet, so the
